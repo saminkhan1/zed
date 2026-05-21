@@ -14,6 +14,11 @@ Base: Zed `v1.3.5` at `0e3bab3c345882d3d500df826c46d2cebe1cb6a8`
 - Selected-file diffs load only the selected path instead of scanning and rendering every changed file.
 - Selected-file diff scrolling is clamped so it does not end on a mostly blank page.
 
+## Related Context
+
+- [Zed discussion: Git Diff - Full File View](https://github.com/zed-industries/zed/discussions/33773)
+- [Reddit: one file at a time in Zed's Git diff](https://www.reddit.com/r/ZedEditor/comments/1n965fz/is_there_a_way_to_view_one_file_at_a_time_in_zeds/)
+
 ## Files Touched
 
 - `crates/git_ui/src/git_panel.rs`
