@@ -37,6 +37,7 @@ pub struct BranchDiff {
     diff_base: DiffBase,
     repo: Option<Entity<Repository>>,
     project: Entity<Project>,
+    path_filter: Option<RepoPath>,
     base_commit: Option<SharedString>,
     head_commit: Option<SharedString>,
     tree_diff: Option<TreeDiff>,
@@ -58,6 +59,16 @@ impl BranchDiff {
     pub fn new(
         source: DiffBase,
         project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_path_filter(source, project, None, window, cx)
+    }
+
+    pub fn new_with_path_filter(
+        source: DiffBase,
+        project: Entity<Project>,
+        path_filter: Option<RepoPath>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -100,6 +111,7 @@ impl BranchDiff {
             diff_base: source,
             repo,
             project,
+            path_filter,
             tree_diff: None,
             tree_diff_update_needed: false,
             tree_diff_base_task: None,
@@ -151,6 +163,41 @@ impl BranchDiff {
         if self.tree_diff_update_needed {
             *self.update_needed.borrow_mut() = ();
         }
+    }
+
+    pub fn set_repo_and_path_filter(
+        &mut self,
+        repo: Option<Entity<Repository>>,
+        path_filter: Option<RepoPath>,
+        cx: &mut Context<Self>,
+    ) {
+        self.repo = repo;
+        self.path_filter = path_filter;
+        self.tree_diff = None;
+        self.tree_diff_update_needed = self.diff_base.is_merge_base();
+        self.tree_diff_base_task = None;
+        self.base_commit = None;
+        self.head_commit = None;
+        cx.emit(BranchDiffEvent::FileListChanged);
+        *self.update_needed.borrow_mut() = ();
+    }
+
+    pub fn path_filter(&self) -> Option<&RepoPath> {
+        self.path_filter.as_ref()
+    }
+
+    pub fn set_path_filter(
+        &mut self,
+        path_filter: Option<RepoPath>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.path_filter == path_filter {
+            return false;
+        }
+
+        self.path_filter = path_filter;
+        cx.emit(BranchDiffEvent::FileListChanged);
+        true
     }
 
     pub async fn handle_status_updates(
@@ -340,8 +387,43 @@ impl BranchDiff {
         if self.diff_base.is_merge_base() && self.tree_diff.is_none() {
             return output;
         }
+        let path_filter = self.path_filter.clone();
 
         self.project.update(cx, |_project, cx| {
+            if let Some(path) = path_filter.as_ref() {
+                let branch_diff = self
+                    .tree_diff
+                    .as_ref()
+                    .and_then(|tree_diff| tree_diff.entries.get(path))
+                    .cloned();
+                let status_from_head = repo
+                    .read(cx)
+                    .status_for_path(path)
+                    .map(|entry| entry.status);
+                let Some(status) = self.merge_statuses(status_from_head, branch_diff.as_ref())
+                else {
+                    return;
+                };
+                if !status.has_changes() {
+                    return;
+                }
+
+                let Some(project_path) = repo.read(cx).repo_path_to_project_path(path, cx) else {
+                    return;
+                };
+                let file_status = status_from_head
+                    .or_else(|| branch_diff.as_ref().map(diff_status_to_file_status))
+                    .unwrap_or(status);
+                let task = Self::load_buffer(branch_diff, project_path, repo.clone(), cx);
+
+                output.push(DiffBuffer {
+                    repo_path: path.clone(),
+                    load: task,
+                    file_status,
+                });
+                return;
+            }
+
             let mut seen = HashSet::default();
 
             for item in repo.read(cx).cached_status() {

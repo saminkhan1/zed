@@ -9,7 +9,8 @@ use anyhow::{Context as _, Result, anyhow};
 use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus};
 use collections::HashMap;
 use editor::{
-    Addon, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
+    Addon, Editor, EditorEvent, EditorMode, EditorSettings, SelectionEffects, SizingBehavior,
+    SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
     multibuffer_context_lines,
     scroll::Autoscroll,
@@ -250,20 +251,24 @@ impl ProjectDiff {
         );
         let intended_repo = workspace.project().read(cx).active_repository(cx);
 
+        let selected_path = entry.as_ref().map(|entry| entry.repo_path.clone());
         let existing = workspace
             .items_of_type::<Self>(cx)
             .find(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Head));
         let project_diff = if let Some(existing) = existing {
-            existing.update(cx, |project_diff, cx| {
-                project_diff.move_to_beginning(window, cx);
-            });
-
             workspace.activate_item(&existing, true, true, window, cx);
             existing
         } else {
             let workspace_handle = cx.entity();
-            let project_diff =
-                cx.new(|cx| Self::new(workspace.project().clone(), workspace_handle, window, cx));
+            let project_diff = cx.new(|cx| {
+                Self::new_with_path_filter(
+                    workspace.project().clone(),
+                    workspace_handle,
+                    selected_path.clone(),
+                    window,
+                    cx,
+                )
+            });
             workspace.add_item_to_active_pane(
                 Box::new(project_diff.clone()),
                 None,
@@ -284,15 +289,25 @@ impl ProjectDiff {
             if needs_switch {
                 project_diff.update(cx, |project_diff, cx| {
                     project_diff.branch_diff.update(cx, |branch_diff, cx| {
-                        branch_diff.set_repo(Some(intended.clone()), cx);
+                        branch_diff.set_repo_and_path_filter(
+                            Some(intended.clone()),
+                            selected_path.clone(),
+                            cx,
+                        );
                     });
+                    project_diff.update_selected_file_scroll_bounds(selected_path.is_some(), cx);
+                    cx.notify();
                 });
             }
         }
 
         if let Some(entry) = entry {
             project_diff.update(cx, |project_diff, cx| {
-                project_diff.move_to_entry(entry, window, cx);
+                project_diff.show_entry(entry, window, cx);
+            })
+        } else {
+            project_diff.update(cx, |project_diff, cx| {
+                project_diff.show_all(window, cx);
             })
         }
     }
@@ -324,7 +339,7 @@ impl ProjectDiff {
             project_diff
         };
         project_diff.update(cx, |project_diff, cx| {
-            project_diff.move_to_project_path(&project_path, window, cx);
+            project_diff.show_project_path(&project_path, window, cx);
         });
     }
 
@@ -373,8 +388,25 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let branch_diff =
-            cx.new(|cx| branch_diff::BranchDiff::new(DiffBase::Head, project.clone(), window, cx));
+        Self::new_with_path_filter(project, workspace, None, window, cx)
+    }
+
+    fn new_with_path_filter(
+        project: Entity<Project>,
+        workspace: Entity<Workspace>,
+        path_filter: Option<RepoPath>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let branch_diff = cx.new(|cx| {
+            branch_diff::BranchDiff::new_with_path_filter(
+                DiffBase::Head,
+                project.clone(),
+                path_filter,
+                window,
+                cx,
+            )
+        });
         Self::new_impl(branch_diff, project, workspace, window, cx)
     }
 
@@ -406,6 +438,10 @@ impl ProjectDiff {
                 DiffBase::Merge { .. } => diff_display_editor.disable_diff_hunk_controls(cx),
             }
             diff_display_editor.rhs_editor().update(cx, |editor, cx| {
+                Self::set_selected_file_scroll_bounds(
+                    editor,
+                    branch_diff.read(cx).path_filter().is_some(),
+                );
                 editor.set_show_diff_review_button(true, cx);
 
                 match branch_diff.read(cx).diff_base() {
@@ -509,14 +545,64 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(git_repo) = self.branch_diff.read(cx).repo() else {
-            return;
-        };
-        let repo = git_repo.read(cx);
-        let sort_prefix = sort_prefix(repo, &entry.repo_path, entry.status, cx);
-        let path_key = PathKey::with_sort_prefix(sort_prefix, entry.repo_path.as_ref().clone());
+        self.move_to_repo_path(&entry.repo_path, entry.status, window, cx)
+    }
 
-        self.move_to_path(path_key, window, cx)
+    pub fn show_entry(
+        &mut self,
+        entry: GitStatusEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let filter_changed = self.set_path_filter(Some(entry.repo_path.clone()), cx);
+        if filter_changed {
+            self.pending_scroll =
+                Some(self.path_key_for_repo_path(&entry.repo_path, entry.status, cx));
+        } else {
+            self.move_to_entry(entry, window, cx);
+        }
+        filter_changed
+    }
+
+    fn show_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_path_filter(None, cx);
+        self.move_to_beginning(window, cx);
+    }
+
+    fn set_path_filter(&mut self, path_filter: Option<RepoPath>, cx: &mut Context<Self>) -> bool {
+        let selected_file_diff = path_filter.is_some();
+        let changed = self.branch_diff.update(cx, |branch_diff, cx| {
+            branch_diff.set_path_filter(path_filter, cx)
+        });
+        if changed {
+            self.update_selected_file_scroll_bounds(selected_file_diff, cx);
+            cx.notify();
+        }
+        changed
+    }
+
+    fn update_selected_file_scroll_bounds(
+        &mut self,
+        selected_file_diff: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |editor, cx| {
+            editor.update_editors(cx, |editor, _cx| {
+                Self::set_selected_file_scroll_bounds(editor, selected_file_diff);
+            });
+        });
+    }
+
+    fn set_selected_file_scroll_bounds(editor: &mut Editor, selected_file_diff: bool) {
+        editor.set_mode(EditorMode::Full {
+            scale_ui_elements_with_buffer_font_size: true,
+            show_active_line_background: true,
+            sizing_behavior: if selected_file_diff {
+                SizingBehavior::ExcludeOverscrollMargin
+            } else {
+                SizingBehavior::Default
+            },
+        });
     }
 
     pub fn move_to_project_path(
@@ -525,23 +611,69 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(git_repo) = self.branch_diff.read(cx).repo() else {
+        let Some((repo_path, status)) = self.repo_path_status(project_path, cx) else {
             return;
         };
-        let Some(repo_path) = git_repo
+        self.move_to_repo_path(&repo_path, status, window, cx)
+    }
+
+    fn show_project_path(
+        &mut self,
+        project_path: &ProjectPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((repo_path, status)) = self.repo_path_status(project_path, cx) else {
+            return;
+        };
+        if self.set_path_filter(Some(repo_path.clone()), cx) {
+            self.pending_scroll = Some(self.path_key_for_repo_path(&repo_path, status, cx));
+        } else {
+            self.move_to_repo_path(&repo_path, status, window, cx)
+        }
+    }
+
+    fn repo_path_status(
+        &self,
+        project_path: &ProjectPath,
+        cx: &mut Context<Self>,
+    ) -> Option<(RepoPath, FileStatus)> {
+        let git_repo = self.branch_diff.read(cx).repo().cloned()?;
+        let repo_path = git_repo
             .read(cx)
-            .project_path_to_repo_path(project_path, cx)
-        else {
-            return;
-        };
+            .project_path_to_repo_path(project_path, cx)?;
         let status = git_repo
             .read(cx)
             .status_for_path(&repo_path)
             .map(|entry| entry.status)
             .unwrap_or(FileStatus::Untracked);
-        let sort_prefix = sort_prefix(&git_repo.read(cx), &repo_path, status, cx);
-        let path_key = PathKey::with_sort_prefix(sort_prefix, repo_path.as_ref().clone());
+        Some((repo_path, status))
+    }
+
+    fn move_to_repo_path(
+        &mut self,
+        repo_path: &RepoPath,
+        status: FileStatus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path_key = self.path_key_for_repo_path(repo_path, status, cx);
         self.move_to_path(path_key, window, cx)
+    }
+
+    fn path_key_for_repo_path(
+        &self,
+        repo_path: &RepoPath,
+        status: FileStatus,
+        cx: &App,
+    ) -> PathKey {
+        let sort_prefix = self
+            .branch_diff
+            .read(cx)
+            .repo()
+            .map(|repo| sort_prefix(&repo.read(cx), repo_path, status, cx))
+            .unwrap_or(TRACKED_SORT_PREFIX);
+        PathKey::with_sort_prefix(sort_prefix, repo_path.as_ref().clone())
     }
 
     pub fn active_path(&self, cx: &App) -> Option<ProjectPath> {
@@ -570,24 +702,35 @@ impl ProjectDiff {
     }
 
     fn move_to_path(&mut self, path_key: PathKey, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(position) = self.multibuffer.read(cx).location_for_path(&path_key, cx) {
-            self.editor.update(cx, |editor, cx| {
-                editor.rhs_editor().update(cx, |editor, cx| {
-                    editor.change_selections(
-                        SelectionEffects::scroll(Autoscroll::focused()),
-                        window,
-                        cx,
-                        |s| {
-                            s.select_ranges([position..position]);
-                        },
-                    )
-                })
-            });
-        } else {
+        if !self.scroll_to_path(&path_key, window, cx) {
             self.pending_scroll = Some(path_key);
         }
     }
 
+    fn scroll_to_path(
+        &mut self,
+        path_key: &PathKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(position) = self.multibuffer.read(cx).location_for_path(path_key, cx) else {
+            return false;
+        };
+
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::focused()),
+                    window,
+                    cx,
+                    |s| {
+                        s.select_ranges([position..position]);
+                    },
+                )
+            })
+        });
+        true
+    }
     pub fn calculate_changed_lines(&self, cx: &App) -> (u32, u32) {
         self.multibuffer.read(cx).snapshot(cx).total_changed_lines()
     }
@@ -808,10 +951,6 @@ impl ProjectDiff {
                 editor.focus_handle(cx).focus(window, cx);
             });
         }
-        if self.pending_scroll.as_ref() == Some(&path_key) {
-            self.move_to_path(path_key, window, cx);
-        }
-
         needs_fold
     }
 
@@ -908,16 +1047,21 @@ impl ProjectDiff {
                 })?;
             }
         }
-        this.update(cx, |this, cx| {
-            if !buffers_to_fold.is_empty() {
-                this.editor.update(cx, |editor, cx| {
-                    editor
-                        .rhs_editor()
-                        .update(cx, |editor, cx| editor.fold_buffers(buffers_to_fold, cx));
-                });
-            }
-            this.pending_scroll.take();
-            cx.notify();
+        cx.update(|window, cx| {
+            this.update(cx, |this, cx| {
+                if !buffers_to_fold.is_empty() {
+                    this.editor.update(cx, |editor, cx| {
+                        editor
+                            .rhs_editor()
+                            .update(cx, |editor, cx| editor.fold_buffers(buffers_to_fold, cx));
+                    });
+                }
+                if let Some(path_key) = this.pending_scroll.take() {
+                    this.scroll_to_path(&path_key, window, cx);
+                }
+                cx.notify();
+            })
+            .ok();
         })?;
 
         Ok(())
@@ -943,6 +1087,17 @@ impl ProjectDiff {
                     .clone()
             })
             .collect()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn uses_tight_scroll_bounds(&self, cx: &App) -> bool {
+        matches!(
+            self.editor().read(cx).rhs_editor().read(cx).mode(),
+            EditorMode::Full {
+                sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+                ..
+            }
+        )
     }
 }
 
@@ -1006,7 +1161,12 @@ impl Item for ProjectDiff {
 
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
         match self.diff_base(cx) {
-            DiffBase::Head => Some("Project Diff".into()),
+            DiffBase::Head => self
+                .branch_diff
+                .read(cx)
+                .path_filter()
+                .map(|path| format!("Project Diff: {}", path.as_std_path().display()).into())
+                .or_else(|| Some("Project Diff".into())),
             DiffBase::Merge { .. } => Some("Branch Diff".into()),
         }
     }
@@ -1022,8 +1182,17 @@ impl Item for ProjectDiff {
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        match self.branch_diff.read(cx).diff_base() {
-            DiffBase::Head => "Uncommitted Changes".into(),
+        let branch_diff = self.branch_diff.read(cx);
+        match branch_diff.diff_base() {
+            DiffBase::Head => branch_diff
+                .path_filter()
+                .map(|path| {
+                    path.file_name()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| path.as_std_path().display().to_string())
+                        .into()
+                })
+                .unwrap_or_else(|| "Uncommitted Changes".into()),
             DiffBase::Merge { base_ref } => format!("Changes since {}", base_ref).into(),
         }
     }

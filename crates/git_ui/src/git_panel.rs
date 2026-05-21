@@ -1283,7 +1283,7 @@ impl GitPanel {
                 let entry = self.entries.get(self.selected_entry?)?.status_entry()?;
 
                 project_diff.update(cx, |project_diff, cx| {
-                    project_diff.move_to_entry(entry.clone(), window, cx);
+                    project_diff.show_entry(entry.clone(), window, cx);
                 });
             }
 
@@ -1368,8 +1368,13 @@ impl GitPanel {
                         .project_path_to_repo_path(&project_path, cx)
                         .as_ref()
             {
+                let filter_changed = project_diff.update(cx, |project_diff, cx| {
+                    project_diff.show_entry(entry.clone(), window, cx)
+                });
                 project_diff.focus_handle(cx).focus(window, cx);
-                project_diff.update(cx, |project_diff, cx| project_diff.autoscroll(cx));
+                if !filter_changed {
+                    project_diff.update(cx, |project_diff, cx| project_diff.autoscroll(cx));
+                }
                 return None;
             };
 
@@ -8376,14 +8381,64 @@ mod tests {
         cx.run_until_parked();
 
         workspace.update_in(cx, |workspace, _window, cx| {
-            let active_path = workspace
+            let project_diff = workspace
                 .item_of_type::<ProjectDiff>(cx)
-                .expect("ProjectDiff should exist")
-                .read(cx)
+                .expect("ProjectDiff should exist");
+            let project_diff = project_diff.read(cx);
+            let active_path = project_diff
                 .active_path(cx)
                 .expect("active_path should exist");
 
             assert_eq!(active_path.path, rel_path("untracked").into_arc());
+            assert_eq!(
+                project_diff.excerpt_paths(cx),
+                vec![rel_path("untracked").into_arc()]
+            );
+            assert!(project_diff.uses_tight_scroll_bounds(cx));
+        });
+
+        // Re-running the project-wide diff action should clear the file filter.
+        cx.focus(&workspace);
+        cx.update(|window, cx| {
+            window.dispatch_action(project_diff::Diff.boxed_clone(), cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, _window, cx| {
+            let project_diff = workspace
+                .item_of_type::<ProjectDiff>(cx)
+                .expect("ProjectDiff should exist");
+            let project_diff = project_diff.read(cx);
+
+            assert_eq!(
+                project_diff.excerpt_paths(cx),
+                vec![
+                    rel_path("tracked").into_arc(),
+                    rel_path("untracked").into_arc()
+                ]
+            );
+            assert!(!project_diff.uses_tight_scroll_bounds(cx));
+        });
+
+        // If the active project-wide diff is already scrolled to the selected
+        // file, Open Diff should still narrow the view to that file.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_entry = Some(0);
+            panel.open_diff(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, _window, cx| {
+            let project_diff = workspace
+                .item_of_type::<ProjectDiff>(cx)
+                .expect("ProjectDiff should exist");
+            let project_diff = project_diff.read(cx);
+
+            assert_eq!(
+                project_diff.excerpt_paths(cx),
+                vec![rel_path("tracked").into_arc()]
+            );
+            assert!(project_diff.uses_tight_scroll_bounds(cx));
         });
     }
 
