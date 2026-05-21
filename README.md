@@ -14,6 +14,12 @@ Base: Zed `v1.3.5` at `0e3bab3c345882d3d500df826c46d2cebe1cb6a8`
 - Selected-file diffs load only the selected path instead of scanning and rendering every changed file.
 - Selected-file diff scrolling is clamped so it does not end on a mostly blank page.
 
+## What Upstream Already Supports
+
+Zed can already show one file's changes if you open the file itself and expand its diff hunks. That is useful, but it is not the same workflow as clicking a file in the Git panel and getting a scoped side-by-side Project Diff.
+
+This fork changes the Git panel's Project Diff behavior. It does not claim Zed had no way to inspect one file's changes.
+
 ## Related Context
 
 - [Zed discussion: Git Diff - Full File View](https://github.com/zed-industries/zed/discussions/33773)
